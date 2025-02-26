@@ -14,7 +14,7 @@ def merge_lora(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--model-base", type=str, required=True)
+    parser.add_argument("--model-base", type=str, default="liuhaotian/llava-v1.5-7b")
     parser.add_argument("--save-model-path", type=str, required=True)
 
     args = parser.parse_args()

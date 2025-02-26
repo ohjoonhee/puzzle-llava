@@ -1,0 +1,123 @@
+import json
+import tqdm
+import os.path as osp
+import re
+
+import argparse
+import torch
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.conversation import conv_templates, SeparatorStyle
+from llava.model.builder import load_pretrained_model
+from llava.utils import disable_torch_init
+from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
+
+from PIL import Image
+
+import requests
+from PIL import Image
+from io import BytesIO
+
+
+def load_image(image_file):
+    if image_file.startswith("http") or image_file.startswith("https"):
+        response = requests.get(image_file)
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+    else:
+        image = Image.open(image_file).convert("RGB")
+    return image
+
+
+def extract_answer_from_output(output):
+    # Extract the answer from the output
+    pattern = re.compile(r"\((\d+), (\d+), (\d+), (\d+)\)")
+    match = pattern.search(output)
+    if match:
+        answer = match.group(0)
+    else:
+        answer = "null"
+
+    return answer
+
+
+def infer_model(args):
+    # Model
+    disable_torch_init()
+
+    model_name = get_model_name_from_path(args.model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name)
+
+    with open("playground/data/pperm_annot/val_2x2.json", "r") as f:
+        val_items = json.load(f)
+    IMAGE_BASE_DIR = "playground/data/pperm_images_val_2x2"
+
+    cnt_correct = 0
+    for val_item in tqdm.tqdm(val_items):
+        qs = val_item["conversations"][0]["value"].replace("<image>\n", "")
+        if model.config.mm_use_im_start_end:
+            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
+
+        if "llama-2" in model_name.lower():
+            conv_mode = "llava_llama_2"
+        elif "v1" in model_name.lower():
+            conv_mode = "llava_v1"
+        elif "mpt" in model_name.lower():
+            conv_mode = "mpt"
+        else:
+            conv_mode = "llava_v0"
+
+        if args.conv_mode is not None and conv_mode != args.conv_mode:
+            print("[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}".format(conv_mode, args.conv_mode, args.conv_mode))
+        else:
+            args.conv_mode = conv_mode
+
+        img_path = osp.join(IMAGE_BASE_DIR, val_item["image"])
+
+        conv = conv_templates[args.conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        image = load_image(img_path)
+        image_tensor = image_processor.preprocess(image, return_tensors="pt")["pixel_values"].half().cuda()
+
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).cuda()
+
+        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        keywords = [stop_str]
+        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+
+        with torch.inference_mode():
+            output_ids = model.generate(input_ids, images=image_tensor, do_sample=True, temperature=0.2, max_new_tokens=1024, use_cache=True, stopping_criteria=[stopping_criteria])
+
+        input_token_len = input_ids.shape[1]
+        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+        if n_diff_input_output > 0:
+            print(f"[Warning] {n_diff_input_output} output_ids are not the same as the input_ids")
+        outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
+        outputs = outputs.strip()
+        if outputs.endswith(stop_str):
+            outputs = outputs[: -len(stop_str)]
+        outputs = outputs.strip()
+        model_answer = extract_answer_from_output(outputs)
+        oracle_answer = str(tuple(val_item["oracle_answer"]))
+
+        cnt_correct += int(model_answer == oracle_answer)
+
+    print(f"Accuracy: {cnt_correct}/{len(val_items)} = {cnt_correct / len(val_items)}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    model_path = "checkpoints/llava-v1.5-7b-pperm-lora-r8-llr-merge"
+    image_path = "extreme-ironing-taxi-swapped.png"
+    parser.add_argument("--model-path", type=str, help="Path to the model", default=model_path)
+    parser.add_argument("--model-base", type=str, help="Base model")
+    # parser.add_argument("--query", type=str, required=True, help="Query")
+    parser.add_argument("--image-file", type=str, help="Image file", default=image_path)
+    parser.add_argument("--conv-mode", type=str, help="Conversation mode")
+    args = parser.parse_args()
+
+    infer_model(args)
